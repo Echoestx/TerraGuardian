@@ -1,4 +1,4 @@
-;; Decentralized Conservation Funding with Extensions
+;; TerraGuardian: Decentralized Funding for Conservation Projects
 
 ;; Constants
 (define-constant ERR_NOT_AUTHORIZED (err u100))
@@ -10,10 +10,15 @@
 (define-constant ERR_INVALID_PARAMETERS (err u106))
 (define-constant ERR_EXISTING_BACKERS (err u107))
 (define-constant ERR_TIMEFRAME_EXTENSION_BLOCKED (err u108))
+(define-constant ERR_REVIEW_ONGOING (err u109))
+(define-constant ERR_APPROVAL_CRITERIA_UNMET (err u110))
 
 ;; Configuration
 (define-constant EXTENSION_FUNDING_REQUIREMENT u75) ;; 75% of the target
 (define-constant MAX_EXTENSION_LENGTH u30)
+(define-constant COMMUNITY_REVIEW_DAYS u7)
+(define-constant MIN_APPROVAL_PERCENTAGE u60) ;; 60% approvals required
+(define-constant MIN_REVIEWER_COUNT u10) ;; At least 10 reviews needed
 
 ;; Data Maps
 (define-map conservation-initiatives 
@@ -25,7 +30,10 @@
     end-date: uint, 
     funds-collected: uint, 
     status-active: bool,
-    extension-count: uint
+    extension-count: uint,
+    review-end-time: uint,
+    total-reviews: uint,
+    positive-reviews: uint
   }
 )
 
@@ -34,12 +42,25 @@
   { funding: uint }
 )
 
+(define-map initiative-reviews
+  { initiative-id: uint, reviewer: principal }
+  { approved: bool }
+)
+
 ;; Variables
 (define-data-var initiative-counter uint u0)
 
 ;; Helper function to check if initiative exists
 (define-private (initiative-exists (initiative-id uint))
   (is-some (map-get? conservation-initiatives { initiative-id: initiative-id }))
+)
+
+;; Helper function to calculate approval rate
+(define-private (calculate-approval-rate (positive-count uint) (total-count uint))
+  (if (is-eq total-count u0)
+    u0
+    (/ (* positive-count u100) total-count)
+  )
 )
 
 ;; Functions
@@ -63,7 +84,10 @@
         end-date: end-date, 
         funds-collected: u0, 
         status-active: true,
-        extension-count: u0
+        extension-count: u0,
+        review-end-time: (+ end-date (* COMMUNITY_REVIEW_DAYS u144)), ;; Assuming 144 blocks per day
+        total-reviews: u0,
+        positive-reviews: u0
       }
     )
     (var-set initiative-counter initiative-id)
@@ -94,6 +118,31 @@
   )
 )
 
+;; Submit a review for a conservation initiative
+(define-public (submit-review (initiative-id uint) (approval bool))
+  (let (
+    (initiative (unwrap! (map-get? conservation-initiatives { initiative-id: initiative-id }) ERR_INITIATIVE_NOT_FOUND))
+    (backer-data (unwrap! (map-get? backed-initiatives { initiative-id: initiative-id, backer: tx-sender }) ERR_NOT_AUTHORIZED))
+  )
+    (asserts! (initiative-exists initiative-id) ERR_INITIATIVE_NOT_FOUND)
+    (asserts! (get status-active initiative) ERR_NOT_AUTHORIZED)
+    (asserts! (<= block-height (get review-end-time initiative)) ERR_TIME_EXPIRED)
+    (asserts! (is-none (map-get? initiative-reviews { initiative-id: initiative-id, reviewer: tx-sender })) ERR_DUPLICATE_INITIATIVE)
+    (map-set initiative-reviews
+      { initiative-id: initiative-id, reviewer: tx-sender }
+      { approved: approval }
+    )
+    (map-set conservation-initiatives
+      { initiative-id: initiative-id }
+      (merge initiative {
+        total-reviews: (+ (get total-reviews initiative) u1),
+        positive-reviews: (if approval (+ (get positive-reviews initiative) u1) (get positive-reviews initiative))
+      })
+    )
+    (ok true)
+  )
+)
+
 ;; Release funds (for initiative stewards)
 (define-public (release-funds (initiative-id uint))
   (let (
@@ -102,7 +151,9 @@
     (asserts! (initiative-exists initiative-id) ERR_INITIATIVE_NOT_FOUND)
     (asserts! (is-eq tx-sender (get steward initiative)) ERR_NOT_AUTHORIZED)
     (asserts! (>= (get funds-collected initiative) (get target-funding initiative)) ERR_TARGET_NOT_ACHIEVED)
-    (asserts! (> block-height (get end-date initiative)) ERR_TIME_EXPIRED)
+    (asserts! (> block-height (get review-end-time initiative)) ERR_REVIEW_ONGOING)
+    (asserts! (>= (get total-reviews initiative) MIN_REVIEWER_COUNT) ERR_APPROVAL_CRITERIA_UNMET)
+    (asserts! (>= (calculate-approval-rate (get positive-reviews initiative) (get total-reviews initiative)) MIN_APPROVAL_PERCENTAGE) ERR_APPROVAL_CRITERIA_UNMET)
     (try! (as-contract (stx-transfer? (get funds-collected initiative) tx-sender (get steward initiative))))
     (map-set conservation-initiatives
       { initiative-id: initiative-id }
@@ -119,8 +170,12 @@
     (backer-data (unwrap! (map-get? backed-initiatives { initiative-id: initiative-id, backer: tx-sender }) ERR_INITIATIVE_NOT_FOUND))
   )
     (asserts! (initiative-exists initiative-id) ERR_INITIATIVE_NOT_FOUND)
-    (asserts! (> block-height (get end-date initiative)) ERR_TIME_EXPIRED)
-    (asserts! (< (get funds-collected initiative) (get target-funding initiative)) ERR_NOT_AUTHORIZED)
+    (asserts! (> block-height (get review-end-time initiative)) ERR_REVIEW_ONGOING)
+    (asserts! (or
+      (< (get funds-collected initiative) (get target-funding initiative))
+      (< (get total-reviews initiative) MIN_REVIEWER_COUNT)
+      (< (calculate-approval-rate (get positive-reviews initiative) (get total-reviews initiative)) MIN_APPROVAL_PERCENTAGE)
+    ) ERR_NOT_AUTHORIZED)
     (try! (as-contract (stx-transfer? (get funding backer-data) tx-sender tx-sender)))
     (map-delete backed-initiatives { initiative-id: initiative-id, backer: tx-sender })
     (ok true)
@@ -163,6 +218,7 @@
       { initiative-id: initiative-id }
       (merge initiative { 
         end-date: new-end-date,
+        review-end-time: (+ new-end-date (* COMMUNITY_REVIEW_DAYS u144)),
         extension-count: (+ (get extension-count initiative) u1)
       })
     )
@@ -180,15 +236,20 @@
   (map-get? backed-initiatives { initiative-id: initiative-id, backer: backer })
 )
 
-(define-read-only (get-extension-eligibility (initiative-id uint))
+(define-read-only (get-reviewer-feedback (initiative-id uint) (reviewer principal))
+  (map-get? initiative-reviews { initiative-id: initiative-id, reviewer: reviewer })
+)
+
+(define-read-only (get-community-feedback (initiative-id uint))
   (match (map-get? conservation-initiatives { initiative-id: initiative-id })
     initiative (ok {
-      can-extend: (and 
-        (< (get extension-count initiative) u3)
-        (>= (* (get funds-collected initiative) u100) (* (get target-funding initiative) EXTENSION_FUNDING_REQUIREMENT))
-      ),
-      extensions-used: (get extension-count initiative),
-      funding-percentage: (/ (* (get funds-collected initiative) u100) (get target-funding initiative))
+      total-reviews: (get total-reviews initiative),
+      positive-reviews: (get positive-reviews initiative),
+      approval-percentage: (calculate-approval-rate (get positive-reviews initiative) (get total-reviews initiative)),
+      criteria-met: (and
+        (>= (get total-reviews initiative) MIN_REVIEWER_COUNT)
+        (>= (calculate-approval-rate (get positive-reviews initiative) (get total-reviews initiative)) MIN_APPROVAL_PERCENTAGE)
+      )
     })
     ERR_INITIATIVE_NOT_FOUND
   )
